@@ -1,0 +1,9 @@
+{
+  "FLAVOR": "prod",
+  "API_BASE_URL": "https://api.your-domain.example",
+  "REVENUECAT_PUBLIC_SDK_KEY_ANDROID": "goog_your_public_sdk_key",
+  "REVENUECAT_PUBLIC_SDK_KEY_IOS": "appl_your_public_sdk_key",
+  "ADMOB_REWARDED_UNIT_ANDROID": "ca-app-pub-xxxxxxxxxxxxxxxx/yyyyyyyyyy",
+  "ADMOB_REWARDED_UNIT_IOS": "ca-app-pub-xxxxxxxxxxxxxxxx/yyyyyyyyyy",
+  "ENABLE_FAKE_PROVIDER_BADGE": false
+}

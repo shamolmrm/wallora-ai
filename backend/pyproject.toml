@@ -1,0 +1,81 @@
+[project]
+name = "wallora-backend"
+version = "0.1.0"
+description = "Wallora AI backend API and generation worker"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.16",
+    "asyncpg>=0.30",
+    "boto3>=1.40",
+    "fastapi>=0.120",
+    "firebase-admin>=7.0",
+    "httpx2>=2.13",
+    "openai>=2.0",
+    "pillow>=11.3",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.10",
+    "python-multipart>=0.0.20",
+    "sqlalchemy[asyncio]>=2.0.40",
+    "uvicorn[standard]>=0.35",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[s3]>=1.40",
+    "mypy>=1.17",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "ruff>=0.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "N", "S", "C4", "SIM", "RUF",
+    "ASYNC", "DTZ", "PT", "RET", "PL", "TRY", "PERF",
+]
+ignore = [
+    "TRY003",  # long exception messages are fine for domain errors
+    # Keyword-only parameters and guard-clause validators are deliberate here; these
+    # Pylint size heuristics would push the code toward less explicit designs.
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "TRY301",
+]
+
+[tool.ruff.lint.isort]
+known-third-party = ["alembic"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "PT018"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+files = ["app", "tests", "scripts", "alembic"]
+
+[[tool.mypy.overrides]]
+module = ["firebase_admin", "firebase_admin.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["postgres: requires TEST_DATABASE_URL pointing at a disposable *_test database"]
+filterwarnings = ["error::sqlalchemy.exc.SADeprecationWarning"]

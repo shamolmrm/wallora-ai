@@ -1,0 +1,45 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"
+      - name: Python dependency audit
+        working-directory: backend
+        run: uvx pip-audit --strict -r <(uv export --locked --no-hashes --format requirements-txt)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: npm audit, production dependencies (gate)
+        working-directory: admin
+        run: npm audit --omit=dev --audit-level=high
+      # Dev-only tooling advisories are reported but don't block. As of 2026-10-18,
+      # GHSA-vfj7-8cjw-p6xm (braces, via eslint-config-next) has no non-breaking fix.
+      - name: npm audit, all dependencies (report only)
+        working-directory: admin
+        continue-on-error: true
+        run: npm audit --audit-level=high

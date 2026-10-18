@@ -1,0 +1,38 @@
+# Package-specific ignores live in backend/, mobile/ and admin/.gitignore files.
+
+# --- Secrets and local environment (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*service-account*.json
+*credentials*.json
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Node ---
+node_modules/
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+
+# --- Local data ---
+*.log
+/tmp/
+/infrastructure/data/

@@ -1,0 +1,30 @@
+# Optional local hooks. Install with:  py -m pip install --user pre-commit && pre-commit install
+# CI runs the same checks, so hooks are a convenience, not the gate.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-json
+        exclude: ^admin/tsconfig\.json$
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff-check
+        files: ^backend/
+        args: ["--config", "backend/pyproject.toml"]
+      - id: ruff-format
+        files: ^backend/
+        args: ["--config", "backend/pyproject.toml"]
