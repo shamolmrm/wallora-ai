@@ -30,6 +30,8 @@ def test_live_returns_ok() -> None:
 def test_docs_disabled_in_prod(monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in PROD_ENV.items():
         monkeypatch.setenv(name, value)
+    # emulators:exec exports this; prod settings rightly refuse to start with it.
+    monkeypatch.delenv("FIRESTORE_EMULATOR_HOST", raising=False)
     get_settings.cache_clear()
     try:
         # No `with`: the lifespan (which would build real clients) is not started.

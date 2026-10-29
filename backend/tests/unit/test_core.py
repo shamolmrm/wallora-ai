@@ -1,3 +1,4 @@
+import os
 import random
 import uuid
 
@@ -63,3 +64,33 @@ def test_backoff_is_exponential_capped_and_jittered() -> None:
     caps = [5, 10, 20, 40, 60, 60, 60]
     for delay, cap in zip(delays, caps, strict=True):
         assert cap * 0.5 <= delay <= cap
+
+
+def test_dev_auth_is_refused_outside_local() -> None:
+    with pytest.raises(ValidationError, match="DEV_AUTH_ENABLED"):
+        make_settings(app_env="staging", dev_auth_enabled=True)
+
+
+async def test_dev_token_verifier() -> None:
+    from app.integrations.auth import AuthError, DevTokenVerifier  # noqa: PLC0415
+
+    identity = await DevTokenVerifier().verify("dev:phone1")
+    assert identity.uid == "dev-phone1"
+    for bad in ("phone1", "dev:", "dev:a b", "firebase:abc"):
+        with pytest.raises(AuthError):
+            await DevTokenVerifier().verify(bad)
+
+
+def test_emulator_host_from_settings_reaches_the_client_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.db.firestore import create_client  # noqa: PLC0415
+
+    monkeypatch.delenv("FIRESTORE_EMULATOR_HOST", raising=False)
+    client = create_client(
+        make_settings(firestore_emulator_host="127.0.0.1:8085", firestore_project_id="demo-x")
+    )
+    try:
+        assert os.environ["FIRESTORE_EMULATOR_HOST"] == "127.0.0.1:8085"
+    finally:
+        client.close()  # type: ignore[no-untyped-call]

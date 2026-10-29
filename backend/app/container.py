@@ -6,15 +6,14 @@ Nothing here performs network calls at construction time.
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy.ext.asyncio import AsyncEngine
+from google.cloud.firestore_v1 import AsyncClient
 
 from app.core.config import ImageProviderName, ModerationProviderName, Settings, StorageBackend
-from app.db.base import utcnow
-from app.db.session import SessionFactory, create_engine, create_session_factory
-from app.integrations.auth import FirebaseTokenVerifier, TokenVerifier
+from app.db.firestore import create_client
+from app.integrations.auth import DevTokenVerifier, FirebaseTokenVerifier, TokenVerifier
 from app.integrations.storage import (
     LocalStorage,
     MemoryStorage,
@@ -30,11 +29,14 @@ from app.providers.moderation.fake import FakeModerationProvider
 from app.providers.moderation.openai import OpenAIModerationProvider
 
 
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass
 class Container:
     settings: Settings
-    engine: AsyncEngine
-    sessions: SessionFactory
+    db: AsyncClient
     storage: ObjectStorage
     image_provider: ImageProvider
     moderation: ModerationProvider
@@ -43,7 +45,7 @@ class Container:
     clock: Callable[[], datetime] = field(default=utcnow)
 
     async def close(self) -> None:
-        await self.engine.dispose()
+        self.db.close()  # type: ignore[no-untyped-call]
 
 
 def build_storage(settings: Settings) -> tuple[ObjectStorage, UrlSigner | None]:
@@ -95,15 +97,20 @@ def build_moderation(settings: Settings) -> ModerationProvider:
 
 
 def build_container(settings: Settings) -> Container:
-    engine = create_engine(settings)
     storage, signer = build_storage(settings)
     return Container(
         settings=settings,
-        engine=engine,
-        sessions=create_session_factory(engine),
+        db=create_client(settings),
         storage=storage,
         image_provider=build_image_provider(settings),
         moderation=build_moderation(settings),
-        token_verifier=FirebaseTokenVerifier(settings.firebase_project_id),
+        token_verifier=build_token_verifier(settings),
         url_signer=signer,
     )
+
+
+def build_token_verifier(settings: Settings) -> TokenVerifier:
+    # Settings validation guarantees dev auth is only possible in local/test.
+    if settings.dev_auth_enabled:
+        return DevTokenVerifier()
+    return FirebaseTokenVerifier(settings.firebase_project_id)

@@ -2,7 +2,7 @@
 
 Legend: `[ ]` not started · `[~]` partially implemented · `[M]` mocked/fake only · `[B]` blocked · `[U]` implemented but untested · `[x]` implemented **and** tested (with evidence)
 
-Last updated: 2026-10-18 — Phase 0 implemented, awaiting review.
+Last updated: 2026-10-18 — Phase 4 moved to Cloud Firestore, awaiting review.
 
 ## Planning
 - [x] Workspace inspected (empty, not a git repo; toolchain recorded in docs/README.md)
@@ -22,7 +22,7 @@ Last updated: 2026-10-18 — Phase 0 implemented, awaiting review.
 - [U] CI workflows (backend, mobile, admin, security/gitleaks): written, **not run** (no remote repository yet)
 - [U] .pre-commit-config.yaml: written, **not run** (pre-commit and gitleaks not installed locally)
 - [B] Local secret scan with gitleaks: not installed. A regex scan for common key formats over all trackable files found no matches.
-- [B] Native PostgreSQL 16+ install (owner) — local dev decision: native, no Docker
+- [x] ~~Native PostgreSQL~~ superseded: database is Cloud Firestore (ADR 0002). JDK 21 + Firebase CLI 15.32.1 installed for the emulator.
 - [B] Native Redis install (Memurai or WSL2) (owner) — optional early; in-memory fallback
 
 ## Phase 1 — Backend core
@@ -43,31 +43,41 @@ Last updated: 2026-10-18 — Phase 0 implemented, awaiting review.
 - [ ] Favorites, user collections, downloads, reports
 - [ ] Seed script (original procedural art)
 
-## Phase 3 — Mobile foundation & catalog UX
-- [ ] Design system + themes
-- [ ] Router shell, API client, auth screens, onboarding
-- [ ] Discover, categories, collections, search/filters
-- [ ] Detail, info, crop/mock-up preview, save/set (Android), iOS guide
-- [ ] Library (favorites, collections, downloads)
-- [ ] All UI states + l10n + semantics
-- [B] Android build — Android SDK/JDK not installed
-- [B] iOS build — no macOS environment
+## Phase 3 — Mobile foundation (started 2026-10-18)
+Evidence: flutter analyze 0 issues, flutter test 7 passed. Debug build installed and running on the owner's phone (CPH2365, Android 13) against the local backend (Firestore emulator + fake provider, `adb reverse tcp:8000`). End-to-end generation verified via the API (job succeeded, image served 200 image/webp).
+- [x] Design tokens + light/dark theme, 5-tab shell (go_router), Riverpod providers, dio API client with problem-code error mapping
+- [x] Studio: prompt, style presets, tier/shape picker filtered by model limits, cost + balance, idempotent submit (key reused on network retry)
+- [x] Generation screen: polling with backoff, cancel while queued, retry, result image, failure/refund messages
+- [x] Library (generation history grid), Profile (credit balance + ledger)
+- [x] Discover/Search show an honest "coming with the catalog" empty state (no mock data)
+- [~] Dev-only sign-in (`dev:<uid>` token, refused outside local/test). **Firebase Auth sign-in screens not built yet** (needs a Firebase project).
+- [ ] Onboarding, save to gallery / set wallpaper (Android), share, favorites/collections, offline caching
+- [ ] Localization: strings are in code, not ARB files yet
+- [ ] Golden tests, accessibility pass (TalkBack, 200% text)
+- [B] iOS build: no macOS
 
-## Phase 4 — Generation backend (PostgreSQL implementation, 2026-10-18)
-Evidence: 122 tests passed on 3 consecutive runs against a throwaway local PostgreSQL 18.4 cluster (since deleted); ruff format/lint clean; mypy strict 0 issues (67 files). No paid calls made.
-- [x] Provider abstraction + `FakeImageProvider`; `OpenAIImageProvider` (generate/edit, safety_identifier, usage-based cost) tested through the real SDK with a mocked HTTP transport only
-- [x] Moderation: local blocklist + OpenAI Moderation adapter (mocked) + fake; fails closed; strikes
-- [x] Prompt validation/normalisation; tier/aspect/size rules from the official docs
-- [x] Upload sanitisation (magic bytes, bomb guards, re-encode, EXIF strip); private storage (S3/R2, local HMAC-signed, memory)
-- [x] Idempotent job creation; atomic credit reserve/capture/release with lots + append-only ledger
-- [x] Spend caps (global day/month, user day cost/count), rate limits, kill switch
-- [x] Worker: SKIP LOCKED claim, leases, reaper, bounded retries with jittered backoff, timeouts, output moderation, lost-lease protection
-- [x] Cancel (queued only), retry, delete (erases prompt + objects), history pagination
-- [U] Real OpenAI calls: **never executed** (requires owner approval and a capped test batch)
-- [U] S3/R2 storage adapter: written, not exercised against a real bucket
-- [U] Firebase token verification: written, not exercised against real Firebase (tests use a fake verifier)
-- [ ] Studio/wallet mobile UI (depends on mobile foundation phase)
-- [~] **Owner decision 2026-10-18: switch persistence to Cloud Firestore (keep FastAPI).** PostgreSQL version committed for reference before the switch.
+## Phase 4 — Generation backend on Cloud Firestore (2026-10-18)
+Owner decision: FastAPI + Firestore (ADR 0002). The earlier PostgreSQL implementation (122 tests passing) is commit `42dc987`, tag `postgres-reference`.
+
+Evidence for the Firestore version: **122 passed on 2 consecutive full runs** against the Firestore emulator (`firebase emulators:exec --only firestore --project demo-wallora`). ruff format/lint clean. mypy strict 0 issues (59 files). API (`uvicorn --factory`) and worker smoke-tested against the emulator. **No paid calls made.**
+- [x] Provider abstraction + `FakeImageProvider`. `OpenAIImageProvider` (generate/edit, safety_identifier, usage-based cost) tested through the real SDK with a mocked HTTP transport only.
+- [x] Moderation: local blocklist + OpenAI Moderation adapter (mocked) + fake. Fails closed. Strikes on the user document.
+- [x] Prompt validation/normalisation. Tier/aspect/size rules from the official docs.
+- [x] Upload sanitisation (magic bytes, bomb guards, re-encode, EXIF strip). Private storage (S3/R2, local HMAC-signed, memory).
+- [x] Idempotent job creation (deterministic idempotency docs in-transaction). Atomic credit reserve/capture/release on the user document. Append-only ledger (`create()` only).
+- [x] Spend caps (global day/month, user day cost/count), per-user rate limits, kill switch.
+- [x] Worker: transactional claim + lease, reaper, bounded retries with jittered backoff, timeouts, output moderation, lost-lease protection, upload purge.
+- [x] Cancel (queued only), retry, delete (erases prompt + objects), history pagination.
+- [x] Firestore security rules deny all client access (backend-only). Rules file written; **not deployed**.
+- [U] Composite indexes (`infrastructure/firebase/firestore.indexes.json`): written, **untested**. The emulator doesn't enforce indexes.
+- [U] Production contention behaviour: emulator locks can take up to 30 s (documented limitation), so tests use 5-way concurrency. **Needs a staging load test (Phase 9).**
+- [U] Real OpenAI calls: **never executed** (requires owner approval and a capped test batch).
+- [U] S3/R2 storage adapter: written, not exercised against a real bucket.
+- [U] Firebase token verification: written, not exercised against real Firebase (tests use a fake verifier).
+- [U] CI workflow updated for the emulator (Java + firebase-tools): written, **not run** (no remote repository).
+- [ ] Studio/wallet mobile UI (depends on the mobile foundation phase).
+- [ ] **Open decision before the catalog phase:** Firestore has no full-text search (tags/filters only vs. a search service).
+- Known workaround: google-cloud-firestore 2.34.1 `AsyncTransaction.get(doc_ref)`/`get_all()` raise `TypeError`. The code uses `ref.get(transaction=…)` / `query.stream(transaction=…)` instead.
 
 ## Phase 5 💲 — OpenAI integration
 - [x] Docs checked 2026-10-18 (models, params, edits, moderation, pricing)

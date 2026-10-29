@@ -17,9 +17,9 @@ flowchart LR
   RC[RevenueCat] --- ST[App Store / Play Billing]
   subgraph Backend [Backend - our infrastructure]
     API[FastAPI API<br/>stateless, N replicas]
-    W[Generation worker<br/>Postgres queue]
+    W[Generation worker<br/>Firestore queue]
     S[Scheduler<br/>reaper, retention, rollups]
-    PG[(PostgreSQL)]
+    PG[(Cloud Firestore)]
     R[(Redis<br/>rate limits, cache)]
   end
   OAI[OpenAI Images API<br/>+ Moderation API]
@@ -56,9 +56,10 @@ flowchart LR
 | Mobile networking | **dio** with interceptors (auth token, App Check, request ID, retry with backoff for idempotent GETs) | |
 | Models | `freezed` + `json_serializable` | Immutable models; codegen kept in CI |
 | Backend framework | **FastAPI + Pydantic v2 + SQLAlchemy 2.x (async, asyncpg) + Alembic** | As specified |
-| Job queue | **PostgreSQL-backed queue** (`SELECT … FOR UPDATE SKIP LOCKED`) | Job state, credit reservation and queue live in **one transactional store**, so reserving credits and enqueuing are atomic. One fewer moving part than Celery/RabbitMQ. Throughput needs (tens of jobs/sec at most) are well within Postgres limits. |
+| Database | **Cloud Firestore** via the Admin/Cloud client ([ADR 0002](adr/0002-firestore-instead-of-postgresql.md); the PostgreSQL version is tagged `postgres-reference`) | Owner decision (2026-10-18): stay on Firebase. Only the backend accesses it; security rules deny all client access. |
+| Job queue | **Firestore-backed queue** (`generation_jobs` + transactional claim with lease) | Job state, credit reservation and queue live in **one transactional store**, so reserving credits and enqueuing are atomic. Fine at tens of jobs per minute. Revisit with Cloud Tasks or Pub/Sub if throughput demands it. |
 | Rate limiting | **Redis** (sliding window, Lua script) | Fast, shared across API replicas. Without Redis (local dev/tests) it falls back to an in-memory limiter. |
-| Search | PostgreSQL full-text (`tsvector` + GIN) + `pg_trgm` for fuzzy tags | No extra search cluster for the MVP. Can move to Meilisearch/OpenSearch later behind a `SearchRepository` interface. |
+| Search | **Open decision (catalog phase):** Firestore has no full-text search. Options: tag/category filters only, or a search service (Typesense, Meilisearch or Algolia; cost and hosting to approve) | Must be decided before the catalog phase. Search sits behind a `SearchRepository` interface either way. |
 | Image processing | Pillow (+ `pillow-avif-plugin` optional) and `blurhash-python` | Re-encode, strip EXIF, thumbnails, dominant colour |
 | Storage | S3 API via `boto3`/`aioboto3`. Cloudflare R2 in prod, **MinIO** locally | One code path for both |
 | Admin UI | Next.js (App Router) + TypeScript + Tailwind + shadcn/ui + TanStack Query/Table | Accessible primitives (Radix), fast to build dense tables |
@@ -131,7 +132,8 @@ wallora-ai/
 │   ├── src/lib/{api,auth}  src/components/
 │   └── tests/ (vitest unit, playwright e2e)
 └── infrastructure/
-    ├── compose.yaml              # postgres, redis, minio, api, worker, admin (local dev)
+    ├── compose.yaml              # redis, minio (optional; local dev runs the Firestore emulator)
+    ├── firebase/                 # firestore.rules, firestore.indexes.json
     ├── docker/                   # backend.Dockerfile, admin.Dockerfile
     ├── nginx/                    # nginx.conf, site configs (api, admin), security headers
     ├── deploy/                   # target-specific manifests (chosen in Phase 9)

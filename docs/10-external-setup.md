@@ -14,13 +14,13 @@
 | Apple Developer Program | iOS builds, IAP, Sign in with Apple, APNs key for FCM | $99/year | Phase 3 (iOS) / 6 |
 | Google Play Console | Android release, billing | $25 one-time | Phase 6 |
 | Google AdMob | Rewarded ads (test IDs during dev) | Free | Phase 6 |
-| Hosting for API/worker (e.g. Fly.io, Render, Railway, Google Cloud Run) + managed Postgres (e.g. Neon, Supabase, Cloud SQL) + Redis (e.g. Upstash) | Staging/prod | Usage-based | Phase 9 💲 |
+| Hosting for API/worker (e.g. Fly.io, Render, Railway, Google Cloud Run) + Firestore on the Firebase project (Blaze plan once free quotas are exceeded) + Redis (e.g. Upstash) | Staging/prod | Usage-based | Phase 9 💲 |
 | Domain + Cloudflare DNS | API, admin, legal pages, account deletion web page | ~$10–15/year | Phase 8/9 |
 | Sentry (optional) | Error monitoring | Free tier | Phase 9 |
 | macOS machine **or** cloud macOS CI (Codemagic / GitHub macOS runners) | iOS builds and signing | Varies | Before any iOS testing |
 
 ## 10.2 Local machine setup (Windows)
-- [ ] **PostgreSQL 16+ (native Windows install)**: official EDB installer from postgresql.org. Create role `wallora` and databases `wallora` + `wallora_test`. Enable the `pg_trgm` and `citext` extensions (bundled with the installer).
+- [x] **Java JDK 21 + Firebase CLI 15.32.1** for the Firestore emulator (installed 2026-10-18). Cloud Firestore replaced PostgreSQL; see ADR 0002.
 - [ ] **Redis (native)**: Redis has no official native Windows build. Options: **Memurai Developer** (Redis-compatible Windows service) or Redis inside **WSL2**. The backend falls back to an in-memory rate limiter when `REDIS_URL` is empty, so Redis is optional for early local development.
 - [ ] Docker is **not used for local development** (owner decision 2026-10-18). Docker remains the packaging/deployment format (Phase 9) and is built in CI or on the server.
 - [ ] **Android Studio** (Android SDK, platform tools, emulator) + **JDK 17**. Then run `flutter doctor --android-licenses`.
@@ -39,7 +39,9 @@ CORS_ALLOWED_ORIGINS=http://localhost:3000
 LOG_LEVEL=INFO
 
 # --- Database / cache ---
-DATABASE_URL=postgresql+asyncpg://wallora:CHANGE_ME@localhost:5432/wallora
+FIRESTORE_PROJECT_ID=                 # defaults to FIREBASE_PROJECT_ID
+FIRESTORE_DATABASE=(default)
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8085   # local only; never in staging/prod
 DATABASE_POOL_SIZE=10
 REDIS_URL=redis://localhost:6379/0
 
@@ -108,7 +110,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=
 ## 10.6 Manual setup tasks by phase
 | Phase | Task (you) |
 |-------|------------|
-| 0 | Approve `git init`. Optionally create an empty remote repo. Install Docker Desktop (or Postgres + Redis). |
+| 0 | Approve `git init`. Optionally create an empty remote repo. |
 | 1 | Create the Firebase dev project, enable Email/Google/Apple providers, create a service account key and store it outside the repo. Tell me the **project ID** only. |
 | 3 | Install Android Studio + JDK 17. Run `flutterfire configure`. Decide the bundle/app ID (e.g. `ai.wallora.app`). |
 | 5 | Create the OpenAI project, set a **hard budget**, put the key in local `.env`, and approve the test batch budget. |

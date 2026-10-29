@@ -2,12 +2,18 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
+from google.cloud.firestore_v1 import AsyncTransaction
+from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
-from sqlalchemy import select
 
 from app.api.deps import ContainerDep, CurrentUser
-from app.modules.credits import service as credits
-from app.modules.credits.models import CreditLedgerEntry
+from app.db.documents import LedgerDoc, UserDoc
+from app.db.firestore import CREDIT_LEDGER, USERS, query_all, run_transaction, tx_get
+from app.modules.credits.service import (
+    BalanceView,
+    CreditBook,
+    next_utc_midnight,
+)
 
 router = APIRouter(prefix="/v1/me/credits", tags=["credits"])
 
@@ -42,16 +48,23 @@ class LedgerPage(BaseModel):
 @router.get("", response_model=CreditsOut)
 async def get_credits(user: CurrentUser, container: ContainerDep) -> CreditsOut:
     s = container.settings
-    now = container.clock()
-    async with container.sessions() as session, session.begin():
-        await credits.ensure_starter_grants(
-            session,
-            user_id=user.id,
-            now=now,
-            welcome_credits=s.welcome_credits,
-            daily_free_credits=s.daily_free_credits,
+    db = container.db
+
+    async def txn_fn(txn: AsyncTransaction) -> BalanceView:
+        now = container.clock()
+        user_ref = db.collection(USERS).document(user.id)
+        current = UserDoc.from_doc((await tx_get(txn, user_ref)).to_dict() or {})
+        book = CreditBook(db, current, now)
+        seq_before = current.ledger_seq
+        book.ensure_starter_grants(
+            welcome_credits=s.welcome_credits, daily_free_credits=s.daily_free_credits
         )
-        view = await credits.balance(session, user.id, now)
+        if current.ledger_seq != seq_before:  # only write when a grant actually happened
+            book.write(txn)
+            txn.set(user_ref, current.to_doc())
+        return book.view()
+
+    view = await run_transaction(db, txn_fn)
     return CreditsOut(
         available=view.available,
         held=view.held,
@@ -59,7 +72,7 @@ async def get_credits(user: CurrentUser, container: ContainerDep) -> CreditsOut:
             LotOut(source=lot.source, remaining=lot.remaining, expires_at=lot.expires_at)
             for lot in view.lots
         ],
-        daily_free_resets_at=credits.next_utc_midnight(now),
+        daily_free_resets_at=next_utc_midnight(container.clock()),
     )
 
 
@@ -70,12 +83,12 @@ async def get_ledger(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     cursor: int | None = None,
 ) -> LedgerPage:
-    stmt = select(CreditLedgerEntry).where(CreditLedgerEntry.user_id == user.id)
+    ledger = container.db.collection(USERS).document(user.id).collection(CREDIT_LEDGER)
+    query = ledger.order_by("seq", direction="DESCENDING")
     if cursor is not None:
-        stmt = stmt.where(CreditLedgerEntry.seq < cursor)
-    stmt = stmt.order_by(CreditLedgerEntry.seq.desc()).limit(limit)
-    async with container.sessions() as session:
-        rows = list((await session.execute(stmt)).scalars())
+        query = query.where(filter=FieldFilter("seq", "<", cursor))
+    snaps = await query_all(query.limit(limit))
+    rows = [LedgerDoc.from_doc(snap.to_dict() or {}) for snap in snaps]
     return LedgerPage(
         items=[
             LedgerEntryOut(

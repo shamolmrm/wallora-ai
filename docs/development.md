@@ -9,43 +9,34 @@
 | uv | 0.13.1 | ✅ installed via `py -m pip install --user uv==0.13.1` |
 | Flutter / Dart | 3.44.1 / 3.12.1 | ✅ installed |
 | Node.js / npm | 24 LTS+ / npm 11 | ✅ Node 26.3.0 |
-| PostgreSQL | 16+ | ❌ to install (native) |
-| Redis | 7+ (Memurai or WSL2) | ❌ to install (optional until rate limiting lands) |
+| Java JDK (for the Firestore emulator) | 11+ | ✅ Temurin 21.0.12 (`winget install EclipseAdoptium.Temurin.21.JDK`) |
+| Firebase CLI | 8.14+ | ✅ 15.32.1 (`npm install -g firebase-tools@15.32.1`) |
+| Redis | 7+ (Memurai or WSL2) | ❌ optional until Redis-backed rate limiting lands |
 | Android Studio + JDK 17 | — | ❌ to install (needed for Android builds) |
 | macOS + Xcode | — | ❌ not available (needed for iOS builds) |
 
 > The Windows `python` command is the Microsoft Store stub on this machine. Use `py` or `py -m uv`.
+> Open a new terminal after installing the JDK so `java` is on `PATH`.
 
-## 2. PostgreSQL (native)
-1. Install PostgreSQL 16 or 17 with the official Windows installer from postgresql.org. Keep the default port 5432.
-2. In `psql` (as the `postgres` superuser), create a role and databases. Choose your own password and **don't share it**:
-   ```sql
-   CREATE ROLE wallora LOGIN PASSWORD '<choose-a-local-password>';
-   CREATE DATABASE wallora OWNER wallora;
-   CREATE DATABASE wallora_test OWNER wallora;
-   \c wallora
-   CREATE EXTENSION IF NOT EXISTS pg_trgm;
-   CREATE EXTENSION IF NOT EXISTS citext;
-   \c wallora_test
-   CREATE EXTENSION IF NOT EXISTS pg_trgm;
-   CREATE EXTENSION IF NOT EXISTS citext;
-   ```
-3. Put the connection URL in `backend/.env` (copied from `.env.example`).
+## 2. Database: Cloud Firestore (emulator locally)
+The backend stores everything in Cloud Firestore ([ADR 0002](adr/0002-firestore-instead-of-postgresql.md)). Locally, use the emulator with a `demo-*` project ID. Demo projects have no real backend, cost nothing and can't touch production data.
 
-## 3. Redis (native)
-Redis doesn't publish native Windows builds. Use either:
-- **Memurai Developer edition** (Redis-compatible Windows service, port 6379), or
-- Redis inside **WSL2** (`sudo apt install redis-server`), reachable at `localhost:6379`.
+```powershell
+# from the repository root (firebase.json lives there)
+firebase emulators:start --only firestore --project demo-wallora   # listens on 127.0.0.1:8085
+```
 
-Until Phase 1 rate limiting lands, Redis is optional. Setting `REDIS_URL=` (empty) selects the in-memory fallback.
+In `backend/.env` set `FIRESTORE_EMULATOR_HOST=127.0.0.1:8085` and `FIRESTORE_PROJECT_ID=demo-wallora`. Emulator data is in memory and disappears when it stops.
 
-## 4. Verify services
+Never set `FIRESTORE_EMULATOR_HOST` in staging or prod; the app refuses to start if you do.
+
+## 3. Verify services
 ```powershell
 cd backend
 py -m uv run python scripts/dev_check.py
 ```
 
-## 5. Run each package
+## 4. Run each package
 See [backend/README.md](../backend/README.md), [mobile/README.md](../mobile/README.md) and the admin section below.
 
 ```powershell
@@ -55,8 +46,14 @@ npm ci
 npm run dev        # http://localhost:3000
 ```
 
-## 6. Quality checks
+## 5. Quality checks
 The per-package commands are listed in [AGENTS.md](../AGENTS.md). CI runs the same commands (`.github/workflows/`).
+
+Backend integration tests need the emulator. `emulators:exec` starts it, runs the tests and stops it:
+```powershell
+cd backend
+firebase emulators:exec --only firestore --project demo-wallora "py -m uv run pytest"
+```
 
 Optional pre-commit hooks:
 ```powershell

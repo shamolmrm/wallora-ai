@@ -35,6 +35,24 @@ class TokenVerifier(Protocol):
     async def verify(self, token: str) -> VerifiedIdentity: ...
 
 
+MAX_DEV_UID_LEN = 64
+
+
+class DevTokenVerifier:
+    """Local development only (see Settings.dev_auth_enabled): ``dev:<uid>`` tokens."""
+
+    async def verify(self, token: str) -> VerifiedIdentity:
+        prefix, _, uid = token.partition(":")
+        if (
+            prefix != "dev"
+            or not uid
+            or len(uid) > MAX_DEV_UID_LEN
+            or not uid.replace("-", "").isalnum()
+        ):
+            raise AuthError("token_invalid")
+        return VerifiedIdentity(f"dev-{uid}", f"{uid}@dev.local", True, "password")
+
+
 class FirebaseTokenVerifier:
     def __init__(self, project_id: str | None) -> None:
         options = {"projectId": project_id} if project_id else None

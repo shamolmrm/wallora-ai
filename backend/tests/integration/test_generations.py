@@ -9,20 +9,17 @@ from typing import Any
 import httpx2
 import pytest
 from PIL import Image
-from sqlalchemy import select
 
 from app.container import Container
-from app.modules.credits.models import CreditLedgerEntry
-from app.modules.moderation.models import ModerationCheck
-from app.modules.spend.models import SpendCounter
-from app.modules.studio.models import GenerationJob
+from app.db.documents import JobDoc
+from app.db.firestore import CREDIT_LEDGER, GENERATION_JOBS, MODERATION_CHECKS, SPEND_COUNTERS
 from app.providers.image.base import ContentBlockedError, ProviderError
 from app.providers.image.fake import FakeImageProvider, FakeOutcome
 from app.providers.moderation.fake import FakeModerationProvider
 from app.worker.processor import GenerationWorker
 from tests.conftest import MutableClock, auth
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.firestore
 
 PROMPT = "misty pine forest at dawn, volumetric light"
 
@@ -49,7 +46,7 @@ def worker(container: Container) -> GenerationWorker:
     return GenerationWorker(container, worker_id="w-test", rng=random.Random(0))  # noqa: S311 - deterministic jitter
 
 
-async def run_one(container: Container) -> uuid.UUID | None:
+async def run_one(container: Container) -> str | None:
     w = worker(container)
     claim = await w.claim()
     if claim is None:
@@ -58,11 +55,18 @@ async def run_one(container: Container) -> uuid.UUID | None:
     return claim.job_id
 
 
-async def job_row(container: Container, job_id: str | uuid.UUID) -> GenerationJob:
-    async with container.sessions() as s:
-        job = await s.get(GenerationJob, uuid.UUID(str(job_id)))
-    assert job is not None
-    return job
+async def job_row(container: Container, job_id: str | uuid.UUID) -> JobDoc:
+    snap = await container.db.collection(GENERATION_JOBS).document(str(job_id)).get()
+    assert snap.exists
+    return JobDoc.from_doc(snap.to_dict() or {})
+
+
+async def docs(container: Container, collection: str) -> list[dict[str, Any]]:
+    return [snap.to_dict() or {} async for snap in container.db.collection(collection).stream()]
+
+
+async def counters(container: Container) -> dict[tuple[str, str], dict[str, Any]]:
+    return {(d["scope"], d["period"]): d for d in await docs(container, SPEND_COUNTERS)}
 
 
 def fake_provider(container: Container) -> FakeImageProvider:
@@ -172,17 +176,21 @@ async def test_create_reserves_credits_and_replays(client: httpx2.AsyncClient) -
 async def test_concurrent_requests_with_same_key_create_one_job(
     client: httpx2.AsyncClient,
 ) -> None:
-    responses = await asyncio.gather(*(create(client, key="same-key-123") for _ in range(10)))
-    assert sorted(r.status_code for r in responses) == [200] * 9 + [202]
+    # 5 concurrent requests: the Firestore emulator can hold locks for up to 30 s under
+    # contention (documented emulator limitation), so higher fan-out only slows CI down.
+    responses = await asyncio.gather(*(create(client, key="same-key-123") for _ in range(5)))
+    assert sorted(r.status_code for r in responses) == [200] * 4 + [202]
     assert len({r.json()["id"] for r in responses}) == 1
     assert await balance(client) == (7, 3)
 
 
 async def test_concurrent_requests_cannot_overspend(client: httpx2.AsyncClient) -> None:
-    responses = await asyncio.gather(*(create(client) for _ in range(10)))
+    # 5 concurrent requests: the Firestore emulator can hold locks for up to 30 s under
+    # contention (documented emulator limitation), so higher fan-out only slows CI down.
+    responses = await asyncio.gather(*(create(client) for _ in range(5)))
     statuses = [r.status_code for r in responses]
     assert statuses.count(202) == 3
-    assert statuses.count(402) == 7
+    assert statuses.count(402) == 2
     assert await balance(client) == (1, 9)
 
 
@@ -207,9 +215,10 @@ async def test_ledger_records_every_movement(
     page = (await client.get("/v1/me/credits/ledger", headers=auth())).json()
     types = [entry["entry_type"] for entry in reversed(page["items"])]
     assert types == ["grant", "reserve", "capture"]
-    async with container.sessions() as s:
-        rows = (await s.execute(select(CreditLedgerEntry.job_id))).scalars().all()
-    assert uuid.UUID(job_id) in rows
+    ledger = [
+        snap.to_dict() or {} async for snap in container.db.collection_group(CREDIT_LEDGER).stream()
+    ]
+    assert job_id in [entry["job_id"] for entry in ledger]
 
 
 # --------------------------------------------------------------------------- moderation & limits
@@ -224,10 +233,9 @@ async def test_blocked_prompts_are_rejected_without_charge(
         assert response.status_code == 422
         assert response.json()["code"] == "prompt_rejected"
     assert await balance(client) == (10, 0)
-    async with container.sessions() as s:
-        checks = (await s.execute(select(ModerationCheck))).scalars().all()
-    assert sorted(c.provider for c in checks) == ["blocklist", "fake"]
-    assert all(c.decision == "block" for c in checks)
+    checks = await docs(container, MODERATION_CHECKS)
+    assert sorted(c["provider"] for c in checks) == ["blocklist", "fake"]
+    assert all(c["decision"] == "block" for c in checks)
 
 
 async def test_moderation_outage_fails_closed(
@@ -264,8 +272,7 @@ async def test_global_cost_cap_pauses_generation_without_charge(
     assert response.status_code == 503
     assert response.json()["code"] == "generation_paused"
     assert await balance(client) == (10, 0)
-    async with container.sessions() as s:
-        assert (await s.execute(select(SpendCounter))).scalars().all() == []
+    assert await docs(container, SPEND_COUNTERS) == []
 
 
 @pytest.mark.parametrize("container", [{"user_daily_generation_cap": 1}], indirect=True)
@@ -319,13 +326,10 @@ async def test_successful_generation(client: httpx2.AsyncClient, container: Cont
     job = await job_row(container, job_id)
     assert job.actual_cost_usd_micros > 0
     assert not job.billing_uncertain
-    async with container.sessions() as s:
-        counters = {
-            (c.scope, c.period): c for c in (await s.execute(select(SpendCounter))).scalars()
-        }
+    found = await counters(container)
     # Spend counters hold the actual cost once the estimate has been corrected.
-    assert counters[("global", "day")].cost_usd_micros == job.actual_cost_usd_micros
-    assert counters[("user", "day")].job_count == 1
+    assert found[("global", "day")]["cost_usd_micros"] == job.actual_cost_usd_micros
+    assert found[("user", "day")]["job_count"] == 1
 
 
 async def test_tampered_signed_url_is_rejected(
@@ -375,11 +379,8 @@ async def test_exhausted_retries_fail_and_refund(
     assert (job.status, job.attempts, job.error_code) == ("failed", 3, "provider_unavailable")
     assert await balance(client) == (10, 0)
     assert await run_one(container) is None
-    async with container.sessions() as s:
-        user_day = (
-            await s.execute(select(SpendCounter).where(SpendCounter.scope == "user"))
-        ).scalar_one()
-    assert (user_day.cost_usd_micros, user_day.job_count) == (0, 0)
+    user_day = (await counters(container))[("user", "day")]
+    assert (user_day["cost_usd_micros"], user_day["job_count"]) == (0, 0)
 
 
 async def test_non_retryable_error_fails_immediately_and_refunds(
@@ -409,15 +410,8 @@ async def test_timeout_counts_estimated_cost_and_refunds(
     assert job.billing_uncertain
     assert job.actual_cost_usd_micros == job.estimated_cost_usd_micros
     assert await balance(client) == (10, 0)
-    async with container.sessions() as s:
-        global_day = (
-            await s.execute(
-                select(SpendCounter).where(
-                    SpendCounter.scope == "global", SpendCounter.period == "day"
-                )
-            )
-        ).scalar_one()
-    assert global_day.cost_usd_micros == job.estimated_cost_usd_micros
+    global_day = (await counters(container))[("global", "day")]
+    assert global_day["cost_usd_micros"] == job.estimated_cost_usd_micros
 
 
 async def test_provider_safety_block_fails_refunds_and_records_strike(
@@ -429,9 +423,8 @@ async def test_provider_safety_block_fails_refunds_and_records_strike(
     job = await job_row(container, job_id)
     assert (job.status, job.error_code) == ("failed", "content_blocked")
     assert await balance(client) == (10, 0)
-    async with container.sessions() as s:
-        check = (await s.execute(select(ModerationCheck))).scalar_one()
-    assert (check.subject_type, check.decision, check.provider) == (
+    (check,) = await docs(container, MODERATION_CHECKS)
+    assert (check["subject_type"], check["decision"], check["provider"]) == (
         "output",
         "block",
         "fake-safety",
@@ -449,8 +442,7 @@ async def test_output_moderation_block_discards_image(
     assert await balance(client) == (10, 0)
     storage = container.storage
     assert not [key for key in getattr(storage, "objects", {}) if "/gen/" in key]
-    async with container.sessions() as s:
-        checks = (await s.execute(select(ModerationCheck))).scalars().all()
+    checks = await docs(container, MODERATION_CHECKS)
     assert len(checks) == 1  # recorded once, not twice
 
 

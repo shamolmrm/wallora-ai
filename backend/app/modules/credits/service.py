@@ -1,32 +1,38 @@
-"""Atomic credit operations.
+"""Atomic credit operations on Firestore.
 
-Every function expects to run inside a caller-owned transaction and starts by
-locking the user's ``credit_accounts`` row. Lock order is always
-account -> lots/reservations -> jobs, which rules out deadlocks between
-concurrent requests for the same user.
+A ``CreditBook`` wraps a user document read inside a transaction. Lots live on
+that document, so every operation runs purely in memory and ``write`` stages
+the ledger entries (the caller writes the user document). Reading the user
+document locks it for the whole transaction, so concurrent credit changes for
+one user are serialised - without any query inside the transaction.
+
+Expired lots are pruned from the document after ``PRUNE_AFTER``; a release
+that finds its lot pruned treats it as expired (refund lot), which is exactly
+what would have happened had the lot still been there.
+
+Available balance is always the live sum of unexpired lot remainders, so
+expiry never leaves a stale cached balance.
 """
 
-import uuid
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 
-from sqlalchemy import ColumnElement, func, or_, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from google.cloud.firestore_v1 import AsyncClient, AsyncTransaction
 
-from app.core.ids import new_id
-from app.modules.credits.models import (
-    CreditAccount,
-    CreditLedgerEntry,
-    CreditLot,
-    CreditReservation,
-    CreditReservationAllocation,
+from app.db.documents import (
+    LedgerDoc,
     LedgerEntryType,
+    LotDoc,
     LotSource,
+    ReservationDoc,
     ReservationStatus,
+    UserDoc,
 )
+from app.db.firestore import CREDIT_LEDGER, USERS
 
 REFUND_LOT_TTL = timedelta(hours=24)
+PRUNE_AFTER = timedelta(hours=48)
 
 
 class InsufficientCreditsError(Exception):
@@ -54,289 +60,189 @@ def next_utc_midnight(now: datetime) -> datetime:
     return datetime.combine(now.astimezone(UTC).date() + timedelta(days=1), time(0), UTC)
 
 
-def _spendable(user_id: uuid.UUID, now: datetime) -> tuple[ColumnElement[bool], ...]:
-    return (
-        CreditLot.user_id == user_id,
-        CreditLot.amount_remaining > 0,
-        or_(CreditLot.expires_at.is_(None), CreditLot.expires_at > now),
-    )
+def lot_id(source: str, source_ref: str) -> str:
+    """Deterministic lot ID: a grant for the same (source, ref) can only exist once."""
+    return hashlib.sha256(f"{source}\x1f{source_ref}".encode()).hexdigest()[:40]
 
 
-async def lock_account(session: AsyncSession, user_id: uuid.UUID) -> CreditAccount:
-    await session.execute(
-        pg_insert(CreditAccount).values(user_id=user_id, held=0).on_conflict_do_nothing()
-    )
-    stmt = (
-        select(CreditAccount)
-        .where(CreditAccount.user_id == user_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    return (await session.execute(stmt)).scalar_one()
+def _spendable(lot: LotDoc, now: datetime) -> bool:
+    return lot.amount_remaining > 0 and (lot.expires_at is None or lot.expires_at > now)
 
 
-async def available_balance(session: AsyncSession, user_id: uuid.UUID, now: datetime) -> int:
-    stmt = select(func.coalesce(func.sum(CreditLot.amount_remaining), 0)).where(
-        *_spendable(user_id, now)
-    )
-    return int((await session.execute(stmt)).scalar_one())
+def _spend_order(lot: LotDoc) -> tuple[bool, datetime, datetime, str]:
+    far_future = datetime.max.replace(tzinfo=UTC)
+    return (lot.expires_at is None, lot.expires_at or far_future, lot.created_at, lot.id)
 
 
-async def _append_ledger(
-    session: AsyncSession,
-    *,
-    account: CreditAccount,
-    entry_type: LedgerEntryType,
-    amount: int,
-    held_delta: int,
-    now: datetime,
-    lot_id: uuid.UUID | None = None,
-    reservation_id: uuid.UUID | None = None,
-    job_id: uuid.UUID | None = None,
-    reason: str | None = None,
-) -> None:
-    await session.flush()
-    available = await available_balance(session, account.user_id, now)
-    session.add(
-        CreditLedgerEntry(
-            id=new_id(),
-            user_id=account.user_id,
-            entry_type=entry_type,
-            amount=amount,
-            held_delta=held_delta,
-            available_after=available,
-            held_after=account.held,
-            lot_id=lot_id,
-            reservation_id=reservation_id,
-            job_id=job_id,
-            reason=reason,
-            created_at=now,
+class CreditBook:
+    def __init__(self, db: AsyncClient, user: UserDoc, now: datetime) -> None:
+        self.user = user
+        self.now = now
+        self._ledger_ref = db.collection(USERS).document(user.id).collection(CREDIT_LEDGER)
+        self.lots: dict[str, LotDoc] = {
+            lid: LotDoc.from_doc(value) for lid, value in user.credit_lots.items()
+        }
+        self._ledger: list[LedgerDoc] = []
+
+    # ------------------------------------------------------------------ queries
+    @property
+    def available(self) -> int:
+        return sum(lot.amount_remaining for lot in self.lots.values() if _spendable(lot, self.now))
+
+    def view(self) -> BalanceView:
+        lots = sorted(
+            (lot for lot in self.lots.values() if _spendable(lot, self.now)), key=_spend_order
         )
-    )
-    await session.flush()
+        return BalanceView(
+            available=sum(lot.amount_remaining for lot in lots),
+            held=self.user.held,
+            lots=[LotView(lot.source, lot.amount_remaining, lot.expires_at) for lot in lots],
+        )
 
+    # ------------------------------------------------------------------ mutations
+    def _record(
+        self,
+        entry_type: LedgerEntryType,
+        *,
+        amount: int,
+        held_delta: int,
+        lot: str | None = None,
+        job_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self.user.ledger_seq += 1
+        self._ledger.append(
+            LedgerDoc(
+                seq=self.user.ledger_seq,
+                user_id=self.user.id,
+                entry_type=entry_type,
+                amount=amount,
+                held_delta=held_delta,
+                available_after=self.available,
+                held_after=self.user.held,
+                lot_id=lot,
+                job_id=job_id,
+                reason=reason,
+                created_at=self.now,
+            )
+        )
 
-async def grant(
-    session: AsyncSession,
-    *,
-    user_id: uuid.UUID,
-    source: LotSource,
-    source_ref: str,
-    amount: int,
-    now: datetime,
-    expires_at: datetime | None = None,
-    reason: str | None = None,
-) -> bool:
-    """Grant credits once per (user, source, source_ref). Returns False if already granted."""
-    if amount <= 0:
-        return False
-    account = await lock_account(session, user_id)
-    lot_id = new_id()
-    stmt = (
-        pg_insert(CreditLot)
-        .values(
-            id=lot_id,
-            user_id=user_id,
+    def grant(
+        self,
+        source: LotSource,
+        source_ref: str,
+        amount: int,
+        *,
+        expires_at: datetime | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        """Grant once per (source, source_ref)."""
+        lid = lot_id(source, source_ref)
+        if amount <= 0 or lid in self.lots:
+            return False
+        self.lots[lid] = LotDoc(
+            id=lid,
             source=source,
             source_ref=source_ref,
             amount_granted=amount,
             amount_remaining=amount,
             expires_at=expires_at,
-            created_at=now,
+            created_at=self.now,
         )
-        .on_conflict_do_nothing(index_elements=["user_id", "source", "source_ref"])
-        .returning(CreditLot.id)
-    )
-    if (await session.execute(stmt)).scalar_one_or_none() is None:
-        return False
-    await _append_ledger(
-        session,
-        account=account,
-        entry_type=LedgerEntryType.GRANT,
-        amount=amount,
-        held_delta=0,
-        now=now,
-        lot_id=lot_id,
-        reason=reason or source,
-    )
-    return True
-
-
-async def ensure_starter_grants(
-    session: AsyncSession,
-    *,
-    user_id: uuid.UUID,
-    now: datetime,
-    welcome_credits: int,
-    daily_free_credits: int,
-) -> None:
-    """Idempotently grant the one-off welcome lot and today's (UTC) free lot."""
-    await grant(
-        session,
-        user_id=user_id,
-        source=LotSource.WELCOME,
-        source_ref="welcome",
-        amount=welcome_credits,
-        now=now,
-    )
-    await grant(
-        session,
-        user_id=user_id,
-        source=LotSource.DAILY_FREE,
-        source_ref=now.astimezone(UTC).date().isoformat(),
-        amount=daily_free_credits,
-        now=now,
-        expires_at=next_utc_midnight(now),
-    )
-
-
-async def reserve(
-    session: AsyncSession, *, user_id: uuid.UUID, job_id: uuid.UUID, amount: int, now: datetime
-) -> CreditReservation:
-    account = await lock_account(session, user_id)
-    lots_stmt = (
-        select(CreditLot)
-        .where(*_spendable(user_id, now))
-        .order_by(CreditLot.expires_at.asc().nulls_last(), CreditLot.created_at, CreditLot.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    lots = list((await session.execute(lots_stmt)).scalars())
-    available = sum(lot.amount_remaining for lot in lots)
-    if available < amount:
-        raise InsufficientCreditsError(amount, available)
-
-    reservation = CreditReservation(
-        id=new_id(),
-        user_id=user_id,
-        job_id=job_id,
-        amount=amount,
-        status=ReservationStatus.HELD,
-        created_at=now,
-    )
-    session.add(reservation)
-    await session.flush()
-    still_needed = amount
-    for lot in lots:
-        take = min(lot.amount_remaining, still_needed)
-        lot.amount_remaining -= take
-        session.add(
-            CreditReservationAllocation(reservation_id=reservation.id, lot_id=lot.id, amount=take)
+        self._record(
+            LedgerEntryType.GRANT, amount=amount, held_delta=0, lot=lid, reason=reason or source
         )
-        still_needed -= take
-        if still_needed == 0:
-            break
-    account.held += amount
-    await _append_ledger(
-        session,
-        account=account,
-        entry_type=LedgerEntryType.RESERVE,
-        amount=-amount,
-        held_delta=amount,
-        now=now,
-        reservation_id=reservation.id,
-        job_id=job_id,
-    )
-    return reservation
+        return True
 
+    def ensure_starter_grants(self, *, welcome_credits: int, daily_free_credits: int) -> None:
+        self.grant(LotSource.WELCOME, "welcome", welcome_credits)
+        self.grant(
+            LotSource.DAILY_FREE,
+            self.now.astimezone(UTC).date().isoformat(),
+            daily_free_credits,
+            expires_at=next_utc_midnight(self.now),
+        )
 
-async def _lock_reservation(
-    session: AsyncSession, user_id: uuid.UUID, job_id: uuid.UUID
-) -> tuple[CreditAccount, CreditReservation | None]:
-    account = await lock_account(session, user_id)
-    stmt = (
-        select(CreditReservation)
-        .where(CreditReservation.job_id == job_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    return account, (await session.execute(stmt)).scalar_one_or_none()
+    def reserve(self, job_id: str, amount: int) -> ReservationDoc:
+        lots = sorted(
+            (lot for lot in self.lots.values() if _spendable(lot, self.now)), key=_spend_order
+        )
+        available = sum(lot.amount_remaining for lot in lots)
+        if available < amount:
+            raise InsufficientCreditsError(amount, available)
+        allocations: list[dict[str, object]] = []
+        needed = amount
+        for lot in lots:
+            take = min(lot.amount_remaining, needed)
+            lot.amount_remaining -= take
+            allocations.append({"lot_id": lot.id, "amount": take})
+            needed -= take
+            if needed == 0:
+                break
+        self.user.held += amount
+        self._record(LedgerEntryType.RESERVE, amount=-amount, held_delta=amount, job_id=job_id)
+        return ReservationDoc(
+            amount=amount,
+            status=ReservationStatus.HELD,
+            allocations=allocations,
+            created_at=self.now,
+        )
 
+    def capture(self, reservation: ReservationDoc, job_id: str) -> bool:
+        """Consume held credits after success. Idempotent."""
+        if reservation.status != ReservationStatus.HELD:
+            return False
+        reservation.status = ReservationStatus.CAPTURED
+        reservation.resolved_at = self.now
+        self.user.held -= reservation.amount
+        self._record(
+            LedgerEntryType.CAPTURE, amount=0, held_delta=-reservation.amount, job_id=job_id
+        )
+        return True
 
-async def capture(
-    session: AsyncSession, *, user_id: uuid.UUID, job_id: uuid.UUID, now: datetime
-) -> bool:
-    """Consume held credits after a successful job. Idempotent."""
-    account, reservation = await _lock_reservation(session, user_id, job_id)
-    if reservation is None or reservation.status != ReservationStatus.HELD:
-        return False
-    reservation.status = ReservationStatus.CAPTURED
-    reservation.resolved_at = now
-    account.held -= reservation.amount
-    await _append_ledger(
-        session,
-        account=account,
-        entry_type=LedgerEntryType.CAPTURE,
-        amount=0,
-        held_delta=-reservation.amount,
-        now=now,
-        reservation_id=reservation.id,
-        job_id=job_id,
-    )
-    return True
-
-
-async def release(
-    session: AsyncSession, *, user_id: uuid.UUID, job_id: uuid.UUID, now: datetime, reason: str
-) -> bool:
-    """Return held credits to their lots (or a 24h refund lot if a lot expired). Idempotent."""
-    account, reservation = await _lock_reservation(session, user_id, job_id)
-    if reservation is None or reservation.status != ReservationStatus.HELD:
-        return False
-    alloc_stmt = (
-        select(CreditReservationAllocation, CreditLot)
-        .join(CreditLot, CreditLot.id == CreditReservationAllocation.lot_id)
-        .where(CreditReservationAllocation.reservation_id == reservation.id)
-        .order_by(CreditLot.id)
-        .with_for_update(of=CreditLot)
-        .execution_options(populate_existing=True)
-    )
-    expired_total = 0
-    for allocation, lot in await session.execute(alloc_stmt):
-        if lot.expires_at is not None and lot.expires_at <= now:
-            expired_total += allocation.amount
-        else:
-            lot.amount_remaining += allocation.amount
-    if expired_total:
-        session.add(
-            CreditLot(
-                id=new_id(),
-                user_id=user_id,
+    def release(self, reservation: ReservationDoc, job_id: str, reason: str) -> bool:
+        """Return held credits to their lots, or a 24h refund lot if a lot expired. Idempotent."""
+        if reservation.status != ReservationStatus.HELD:
+            return False
+        expired = 0
+        for allocation in reservation.allocation_list():
+            lot = self.lots.get(allocation.lot_id)  # None: pruned, which implies expired
+            if lot is None or (lot.expires_at is not None and lot.expires_at <= self.now):
+                expired += allocation.amount
+            else:
+                lot.amount_remaining += allocation.amount
+        if expired:
+            refund = lot_id(LotSource.REFUND, job_id)
+            self.lots[refund] = LotDoc(
+                id=refund,
                 source=LotSource.REFUND,
-                source_ref=str(reservation.id),
-                amount_granted=expired_total,
-                amount_remaining=expired_total,
-                expires_at=now + REFUND_LOT_TTL,
-                created_at=now,
+                source_ref=job_id,
+                amount_granted=expired,
+                amount_remaining=expired,
+                expires_at=self.now + REFUND_LOT_TTL,
+                created_at=self.now,
             )
+        reservation.status = ReservationStatus.RELEASED
+        reservation.resolved_at = self.now
+        self.user.held -= reservation.amount
+        self._record(
+            LedgerEntryType.RELEASE,
+            amount=reservation.amount,
+            held_delta=-reservation.amount,
+            job_id=job_id,
+            reason=reason,
         )
-    reservation.status = ReservationStatus.RELEASED
-    reservation.resolved_at = now
-    account.held -= reservation.amount
-    await _append_ledger(
-        session,
-        account=account,
-        entry_type=LedgerEntryType.RELEASE,
-        amount=reservation.amount,
-        held_delta=-reservation.amount,
-        now=now,
-        reservation_id=reservation.id,
-        job_id=job_id,
-        reason=reason,
-    )
-    return True
+        return True
 
-
-async def balance(session: AsyncSession, user_id: uuid.UUID, now: datetime) -> BalanceView:
-    lots_stmt = (
-        select(CreditLot)
-        .where(*_spendable(user_id, now))
-        .order_by(CreditLot.expires_at.asc().nulls_last(), CreditLot.created_at)
-    )
-    lots = list((await session.execute(lots_stmt)).scalars())
-    held = await session.scalar(select(CreditAccount.held).where(CreditAccount.user_id == user_id))
-    return BalanceView(
-        available=sum(lot.amount_remaining for lot in lots),
-        held=held or 0,
-        lots=[LotView(lot.source, lot.amount_remaining, lot.expires_at) for lot in lots],
-    )
+    # ------------------------------------------------------------------ persistence
+    def write(self, txn: AsyncTransaction) -> None:
+        """Store lots on the user (the caller writes the user document) and stage the ledger."""
+        cutoff = self.now - PRUNE_AFTER
+        self.user.credit_lots = {
+            lid: lot.to_doc()
+            for lid, lot in self.lots.items()
+            if lot.expires_at is None or lot.expires_at > cutoff
+        }
+        for entry in self._ledger:
+            # create() fails if the sequence number exists: ledger entries are never overwritten.
+            txn.create(self._ledger_ref.document(f"{entry.seq:012d}"), entry.to_doc())

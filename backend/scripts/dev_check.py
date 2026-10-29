@@ -1,11 +1,11 @@
-"""Check that local development services (PostgreSQL, Redis) are reachable.
+"""Check that local development services are reachable.
 
 Uses only the standard library so it runs before dependencies are installed:
 
-    uv run python scripts/dev_check.py
+    py -m uv run python scripts/dev_check.py
 
-Reads DATABASE_URL and REDIS_URL from the environment or backend/.env.
-Only host and port are checked; credentials are never printed.
+Reads FIRESTORE_EMULATOR_HOST and REDIS_URL from the environment or
+backend/.env. Only host and port are checked; credentials are never printed.
 """
 
 import os
@@ -16,10 +16,9 @@ from urllib.parse import urlsplit
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 DEFAULTS = {
-    "DATABASE_URL": "postgresql+asyncpg://localhost:5432/wallora",
-    "REDIS_URL": "redis://localhost:6379/0",
+    "FIRESTORE_EMULATOR_HOST": "127.0.0.1:8085",
+    "REDIS_URL": "",
 }
-DEFAULT_PORTS = {"DATABASE_URL": 5432, "REDIS_URL": 6379}
 
 
 def load_env_file() -> dict[str, str]:
@@ -35,10 +34,16 @@ def load_env_file() -> dict[str, str]:
     return values
 
 
-def check(name: str, url: str) -> bool:
-    parts = urlsplit(url)
-    host = parts.hostname or "localhost"
-    port = parts.port or DEFAULT_PORTS[name]
+def host_port(name: str, value: str) -> tuple[str, int]:
+    if name == "FIRESTORE_EMULATOR_HOST":  # plain host:port
+        host, _, port = value.rpartition(":")
+        return host or "127.0.0.1", int(port)
+    parts = urlsplit(value)
+    return parts.hostname or "localhost", parts.port or 6379
+
+
+def check(name: str, value: str) -> bool:
+    host, port = host_port(name, value)
     try:
         with socket.create_connection((host, port), timeout=2):
             pass
@@ -53,11 +58,11 @@ def main() -> int:
     env_file = load_env_file()
     results = []
     for name, default in DEFAULTS.items():
-        url = os.environ.get(name, env_file.get(name, default))
-        if not url:
-            print(f"SKIP  {name}: set to empty (in-memory fallback)")
+        value = os.environ.get(name, env_file.get(name, default))
+        if not value:
+            print(f"SKIP  {name}: not set")
             continue
-        results.append(check(name, url))
+        results.append(check(name, value))
     return 0 if all(results) else 1
 
 

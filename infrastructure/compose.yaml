@@ -1,22 +1,9 @@
-# Optional local dependency stack. Not required: the owner's machine runs
-# PostgreSQL and Redis natively. Image tags are pinned by digest in Phase 9.
+# Optional local dependency stack (Redis, MinIO). The database is Cloud Firestore;
+# locally use the Firestore emulator (see docs/development.md). Image tags are pinned by digest in Phase 9.
 # Credentials below are local-only placeholders; override via a gitignored .env.
 name: wallora
 
 services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-wallora}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infrastructure/.env}
-      POSTGRES_DB: wallora
-    ports: ["127.0.0.1:5432:5432"]
-    volumes: ["./data/postgres:/var/lib/postgresql/data"]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wallora}"]
-      interval: 5s
-      retries: 10
-
   redis:
     image: redis:8
     ports: ["127.0.0.1:6379:6379"]

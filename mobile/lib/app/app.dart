@@ -1,58 +1,31 @@
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 
-import 'env.dart';
+import '../core/design_system/theme.dart';
+import 'router.dart';
 
-/// Root widget. Phase 3 replaces the placeholder home with the design system,
-/// router and feature screens.
-class WalloraApp extends StatelessWidget {
-  const WalloraApp({super.key, required this.env});
+class WalloraApp extends StatefulWidget {
+  const WalloraApp({super.key, this.router});
 
-  final AppEnv env;
+  /// Injectable for tests.
+  final GoRouter? router;
+
+  @override
+  State<WalloraApp> createState() => _WalloraAppState();
+}
+
+class _WalloraAppState extends State<WalloraApp> {
+  late final GoRouter _router = widget.router ?? buildRouter();
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    return MaterialApp.router(
       title: 'Wallora AI',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.system,
-      theme: ThemeData(colorSchemeSeed: const Color(0xFF5B5BD6)),
-      darkTheme: ThemeData(
-        colorSchemeSeed: const Color(0xFF5B5BD6),
-        brightness: Brightness.dark,
-      ),
-      home: _PlaceholderHome(env: env),
-    );
-  }
-}
-
-class _PlaceholderHome extends StatelessWidget {
-  const _PlaceholderHome({required this.env});
-
-  final AppEnv env;
-
-  @override
-  Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text('Wallora AI', style: textTheme.headlineMedium),
-                const SizedBox(height: 8),
-                Text(
-                  'Foundation build (${env.flavor}). Features are not implemented yet.',
-                  style: textTheme.bodyMedium,
-                  textAlign: TextAlign.center,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+      theme: buildTheme(Brightness.light),
+      darkTheme: buildTheme(Brightness.dark),
+      routerConfig: _router,
     );
   }
 }

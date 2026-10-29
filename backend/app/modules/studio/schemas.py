@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from app.modules.studio.models import JobKind
+from app.db.documents import JobKind
 
 
 class CreateGenerationRequest(BaseModel):

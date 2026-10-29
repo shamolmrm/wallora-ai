@@ -3,9 +3,9 @@ name: backend
 on:
   push:
     branches: [main]
-    paths: ["backend/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "firebase.json", "infrastructure/firebase/**", ".github/workflows/backend.yml"]
   pull_request:
-    paths: ["backend/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "firebase.json", "infrastructure/firebase/**", ".github/workflows/backend.yml"]
 
 permissions:
   contents: read
@@ -30,4 +30,13 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy
-      - run: uv run pytest
+      # Integration tests run against the Firestore emulator (demo-* project, no real data).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install -g firebase-tools@15.32.1
+      - run: firebase emulators:exec --only firestore --project demo-wallora "uv run pytest"

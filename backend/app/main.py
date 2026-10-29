@@ -8,6 +8,7 @@ from app.container import Container, build_container
 from app.core.config import AppEnv, get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging
+from app.modules.catalog.router import router as catalog_router
 from app.modules.credits.router import router as credits_router
 from app.modules.studio.router import router as studio_router
 
@@ -43,6 +44,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def live() -> dict[str, str]:
         return {"status": "ok"}
 
+    app.include_router(catalog_router)
     app.include_router(studio_router)
     app.include_router(credits_router)
     app.include_router(files.router)

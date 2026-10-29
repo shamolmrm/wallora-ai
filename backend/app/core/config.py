@@ -46,12 +46,15 @@ class Settings(BaseSettings):
     app_base_url: str = "http://localhost:8000"
     log_level: str = "INFO"
 
-    # --- Database ---
-    database_url: str = "postgresql+asyncpg://wallora@localhost:5432/wallora"
-    database_pool_size: int = Field(default=10, ge=1, le=100)
-
-    # --- Auth ---
+    # --- Auth / Firestore ---
     firebase_project_id: str | None = None
+    firestore_project_id: str | None = None  # defaults to FIREBASE_PROJECT_ID
+    firestore_database: str = "(default)"
+    # Read by the Firestore client library itself; declared so it can be validated.
+    firestore_emulator_host: str | None = None
+    # Local-only sign-in for running the app before Firebase Auth is configured:
+    # accepts "dev:<uid>" bearer tokens. Refused outside local/test.
+    dev_auth_enabled: bool = False
 
     # --- Storage ---
     storage_backend: StorageBackend = StorageBackend.LOCAL
@@ -121,6 +124,10 @@ class Settings(BaseSettings):
                 problems.append("STORAGE_SIGNING_SECRET must be set")
             if not self.firebase_project_id:
                 problems.append("FIREBASE_PROJECT_ID is required")
+            if self.firestore_emulator_host:
+                problems.append("FIRESTORE_EMULATOR_HOST must not be set outside local/test")
+            if self.dev_auth_enabled:
+                problems.append("DEV_AUTH_ENABLED must not be set outside local/test")
         if self.app_env is AppEnv.PROD:
             if self.image_provider is ImageProviderName.FAKE:
                 problems.append("IMAGE_PROVIDER=fake is not allowed in prod")
